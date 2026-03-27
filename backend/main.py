@@ -803,6 +803,140 @@ async def verify_rx_upload(
         raise HTTPException(status_code=500, detail=str(e))
 
 
+# ── Pharmacist Dashboard Data (bypasses RLS via service role key) ─────────────
+
+@app.get("/pharmacist/recent-orders")
+async def pharmacist_recent_orders(limit: int = 50):
+    """
+    Returns all recent orders with patient names and order items.
+    Uses service role key so RLS is bypassed - for pharmacist dashboard.
+    """
+    try:
+        sb = _get_sb()
+        # Fetch orders with joined patient profile and order items
+        res = sb.table("orders").select(
+            "id, status, created_at, patient_id"
+        ).order("created_at", desc=True).limit(limit).execute()
+
+        orders = res.data or []
+
+        # Enrich each order with patient name and items
+        for order in orders:
+            pid = order.get("patient_id")
+            name = "Unknown"
+            if pid:
+                # Try patients table first (may have full_name directly)
+                try:
+                    pt = sb.table("patients").select("full_name, user_id").eq("id", pid).maybe_single().execute()
+                    if pt.data and pt.data.get("full_name"):
+                        name = pt.data["full_name"]
+                    elif pt.data and pt.data.get("user_id"):
+                        # Follow user_id → profiles.full_name
+                        prof = sb.table("profiles").select("full_name").eq("id", pt.data["user_id"]).maybe_single().execute()
+                        if prof.data:
+                            name = prof.data.get("full_name", "Unknown")
+                    else:
+                        # Fallback: try profiles directly with pid
+                        prof = sb.table("profiles").select("full_name").eq("id", pid).maybe_single().execute()
+                        if prof.data:
+                            name = prof.data.get("full_name", "Unknown")
+                except Exception:
+                    pass
+            order["patient_name"] = name
+
+            # Get order items with medicine names
+            items_res = sb.table("order_items").select(
+                "id, qty, medicine_id, medicines(name)"
+            ).eq("order_id", order["id"]).execute()
+            order["order_items"] = items_res.data or []
+
+        return {"success": True, "orders": orders}
+    except Exception as e:
+        print(f"Pharmacist orders error: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/pharmacist/refill-alerts")
+async def pharmacist_refill_alerts():
+    """
+    Returns pending refill alerts with patient names and medicine info.
+    Uses service role key to bypass RLS.
+    Falls back to low-stock medicines if no real alerts exist.
+    """
+    try:
+        sb = _get_sb()
+
+        # 1. Try real refill_alerts table
+        alerts_res = sb.table("refill_alerts").select(
+            "id, status, predicted_runout_date, patient_id, medicine_id"
+        ).eq("status", "pending").order("predicted_runout_date", desc=False).execute()
+
+        alerts = alerts_res.data or []
+
+        enriched = []
+        for alert in alerts:
+            item = {
+                "id": alert["id"],
+                "status": alert["status"],
+                "predicted_runout_date": alert.get("predicted_runout_date"),
+                "patient_name": "Unknown",
+                "medicine_name": "Unknown",
+            }
+
+            # Resolve patient name
+            pid = alert.get("patient_id")
+            if pid:
+                try:
+                    pt = sb.table("patients").select("full_name, user_id").eq("id", pid).maybe_single().execute()
+                    if pt.data and pt.data.get("full_name"):
+                        item["patient_name"] = pt.data["full_name"]
+                    elif pt.data and pt.data.get("user_id"):
+                        prof = sb.table("profiles").select("full_name").eq("id", pt.data["user_id"]).maybe_single().execute()
+                        if prof.data:
+                            item["patient_name"] = prof.data.get("full_name", "Unknown")
+                    else:
+                        prof = sb.table("profiles").select("full_name").eq("id", pid).maybe_single().execute()
+                        if prof.data:
+                            item["patient_name"] = prof.data.get("full_name", "Unknown")
+                except Exception:
+                    pass
+
+            # Resolve medicine name
+            mid = alert.get("medicine_id")
+            if mid:
+                try:
+                    med = sb.table("medicines").select("name, stock").eq("id", mid).maybe_single().execute()
+                    if med.data:
+                        item["medicine_name"] = med.data.get("name", "Unknown")
+                        item["current_stock"] = med.data.get("stock", 0)
+                except Exception:
+                    pass
+
+            enriched.append(item)
+
+        # 2. Fallback: if no alerts, use low-stock medicines as synthetic refill items
+        if not enriched:
+            low_stock = sb.table("medicines").select(
+                "id, name, stock, reorder_threshold"
+            ).lte("stock", 10).order("stock", desc=False).limit(5).execute()
+
+            for med in (low_stock.data or []):
+                enriched.append({
+                    "id": med["id"],
+                    "status": "pending",
+                    "predicted_runout_date": None,
+                    "patient_name": None,  # system alert, no patient
+                    "medicine_name": med.get("name", "Unknown"),
+                    "current_stock": med.get("stock", 0),
+                    "is_stock_alert": True,
+                })
+
+        return {"success": True, "refill_alerts": enriched}
+    except Exception as e:
+        print(f"Pharmacist refill-alerts error: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
 # ── Dose-consumption models ──────────────────────────────────────────────────
 
 class ConsumeDoseRequest(BaseModel):
